@@ -247,9 +247,17 @@ class Panel:
             if not routes:
                 raise RuntimeError("未找到 IPv6 默认路由")
             route = sorted(routes, key=lambda item: item.get("metric", 0))[0]
-            iface, preferred_source = route.get("dev", ""), route.get("prefsrc", route.get("src", ""))
+            iface = route.get("dev", "")
         if not iface:
             raise RuntimeError("无法识别 IPv6 网卡")
+        # A default-route listing usually has no source address.  Ask the
+        # kernel which source it would actually use so stale panel addresses
+        # cannot make an old, lexicographically earlier prefix win.
+        probe = self.run(["ip", "-j", "-6", "route", "get", "2606:4700:4700::1111"], check=False)
+        if probe.returncode == 0:
+            route_choices = json.loads(probe.stdout or "[]")
+            route = next((item for item in route_choices if item.get("dev") == iface), route_choices[0] if route_choices else {})
+            preferred_source = route.get("prefsrc", route.get("src", ""))
         addresses = json.loads(self.run(["ip", "-j", "addr", "show", "dev", iface]).stdout or "[]")
         addr_info = addresses[0].get("addr_info", []) if addresses else []
         candidates = []
@@ -266,7 +274,9 @@ class Panel:
                 continue
             plen = int(item.get("prefixlen", 128))
             flags = {str(flag).lower() for flag in item.get("flags", [])}
-            managed = bool(item.get("noprefixroute")) or "noprefixroute" in flags
+            # SLAAC addresses may also be marked noprefixroute.  Addresses
+            # created by this panel are the nodad+noprefixroute combination.
+            managed = (bool(item.get("nodad")) or "nodad" in flags) and (bool(item.get("noprefixroute")) or "noprefixroute" in flags)
             global_addresses.append((str(ip), managed))
             if plen < 128:
                 candidates.append(ipaddress.ip_network("%s/%d" % (local, plen), strict=False))
@@ -282,17 +292,19 @@ class Panel:
             prefix = next((n for n in unique if preferred and preferred in n), unique[0])
         # Panel-managed addresses use noprefixroute. Prefer a system/tunnel
         # address as the stable HY2 ingress on hosts with an IPv6 address pool.
-        stable = [address for address, managed in global_addresses if not managed]
-        ingress_ipv6 = stable[0] if stable else preferred_source
+        stable = [address for address, managed in global_addresses if not managed and ipaddress.ip_address(address) in prefix]
+        ingress_ipv6 = preferred_source if preferred_source and ipaddress.ip_address(preferred_source) in prefix else (stable[0] if stable else "")
         return {"interface": iface, "prefix": str(prefix), "ipv4": ipv4, "ipv6": ingress_ipv6}, prefix
 
     def start(self):
         iface = self.state.get("ipv6Interface") or self.cfg.ipv6_interface
         prefix = self.state.get("ipv6Prefix") or self.cfg.ipv6_prefix
         self.network, self.prefix = self.discover_network(iface, prefix)
+        stale_ips = []
         for proxy in self.state["proxies"]:
             ip = ipaddress.ip_address(proxy["ipv6"])
             if ip not in self.prefix:
+                stale_ips.append(str(ip))
                 proxy["ipv6"] = str(self.random_ip())
             self.add_address(proxy["ipv6"])
             proxy["status"] = "healthy"
@@ -301,7 +313,11 @@ class Panel:
             self._create_proxies(self.cfg.admin_username, "hy2", missing)
         self.save()
         self.restart_xray()
+        for stale_ip in stale_ips:
+            self.run(["ip", "-6", "addr", "del", "%s/%d" % (stale_ip, self.prefix.prefixlen), "dev", self.network["interface"]], check=False)
         threading.Thread(target=self.monitor_xray, daemon=True).start()
+        if not (self.state.get("ipv6Prefix") or self.cfg.ipv6_prefix):
+            threading.Thread(target=self.monitor_network, daemon=True).start()
 
     def stop(self):
         self.stopping.set()
@@ -316,6 +332,19 @@ class Panel:
                         self.restart_xray()
                     except Exception as error:
                         print("Xray 自动重启失败：%s" % error, file=sys.stderr, flush=True)
+
+    def monitor_network(self):
+        while not self.stopping.wait(10):
+            try:
+                iface = self.state.get("ipv6Interface") or self.cfg.ipv6_interface
+                _, detected_prefix = self.discover_network(iface, "")
+                if detected_prefix == self.prefix:
+                    continue
+                print("检测到 IPv6 前缀变化：%s -> %s，正在自动迁移线路" % (self.prefix, detected_prefix), flush=True)
+                self.update_network(iface, str(detected_prefix), persist_prefix=False)
+                print("IPv6 前缀自动迁移完成：%s" % detected_prefix, flush=True)
+            except Exception as error:
+                print("IPv6 前缀自动检测/迁移失败：%s" % error, file=sys.stderr, flush=True)
 
     def random_ip(self):
         used = {ipaddress.ip_address(p["ipv6"]) for p in self.state["proxies"]}
@@ -667,7 +696,7 @@ class Panel:
                 self.delete_address(proxy["ipv6"])
             self.save()
 
-    def update_network(self, iface, prefix):
+    def update_network(self, iface, prefix, persist_prefix=True):
         with self.lock:
             info, network = self.discover_network(iface, prefix)
             old_info, old_prefix = self.network, self.prefix
@@ -686,7 +715,8 @@ class Panel:
                 for old_ip in old_ips:
                     self.run(["ip", "-6", "addr", "del", "%s/%d" % (old_ip, old_prefix.prefixlen), "dev", old_info["interface"]], check=False)
                 self.state["ipv6Interface"] = iface.strip()
-                self.state["ipv6Prefix"] = prefix.strip()
+                if persist_prefix:
+                    self.state["ipv6Prefix"] = prefix.strip()
                 self.save()
                 return info
             except Exception:

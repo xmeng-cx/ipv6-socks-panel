@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,6 +65,31 @@ class HTTPPanelStub:
 
 
 class PanelPythonTests(unittest.TestCase):
+    def test_auto_discovery_uses_kernel_route_source_with_explicit_interface(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = app.Panel(ConfigStub(directory))
+            current = "240e:390:78c2:3e70:967d:5a08:8ed4:7fa8"
+            stale = "240e:390:78c2:2e40:1111::1"
+
+            def fake_run(args, timeout=20, check=True):
+                if args[3:6] == ["route", "show", "default"]:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{"dev": "enp2s0", "metric": 100}]), stderr="")
+                if args[3:5] == ["route", "get"]:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{"dev": "enp2s0", "prefsrc": current}]), stderr="")
+                if args[1:4] == ["-j", "addr", "show"]:
+                    entries = [
+                        {"family": "inet", "local": "192.168.1.9", "prefixlen": 24, "scope": "global"},
+                        {"family": "inet6", "local": stale, "prefixlen": 64, "scope": "global", "nodad": True, "noprefixroute": True},
+                        {"family": "inet6", "local": current, "prefixlen": 64, "scope": "global", "temporary": True, "dynamic": True},
+                    ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{"addr_info": entries}]), stderr="")
+                raise AssertionError(args)
+
+            with mock.patch.object(panel, "run", side_effect=fake_run):
+                info, prefix = panel.discover_network("enp2s0", "")
+            self.assertEqual(str(prefix), "240e:390:78c2:3e70::/64")
+            self.assertEqual(info["ipv6"], current)
+
     def test_ipv4_and_ipv6_listen_addresses_are_parsed(self):
         self.assertEqual(app.parse_listen("0.0.0.0:8080"), ("0.0.0.0", 8080))
         self.assertEqual(app.parse_listen("[::]:443"), ("::", 443))
