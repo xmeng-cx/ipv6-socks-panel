@@ -69,6 +69,7 @@ class PanelPythonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             panel = app.Panel(ConfigStub(directory))
             current = "240e:390:78c2:3e70:967d:5a08:8ed4:7fa8"
+            stable = "240e:390:78c2:3e70:2e0:70ff:fe89:6576"
             stale = "240e:390:78c2:2e40:1111::1"
 
             def fake_run(args, timeout=20, check=True):
@@ -81,6 +82,7 @@ class PanelPythonTests(unittest.TestCase):
                         {"family": "inet", "local": "192.168.1.9", "prefixlen": 24, "scope": "global"},
                         {"family": "inet6", "local": stale, "prefixlen": 64, "scope": "global", "nodad": True, "noprefixroute": True},
                         {"family": "inet6", "local": current, "prefixlen": 64, "scope": "global", "temporary": True, "dynamic": True},
+                        {"family": "inet6", "local": stable, "prefixlen": 64, "scope": "global", "dynamic": True, "noprefixroute": True},
                     ]
                     return SimpleNamespace(returncode=0, stdout=json.dumps([{"addr_info": entries}]), stderr="")
                 raise AssertionError(args)
@@ -88,7 +90,22 @@ class PanelPythonTests(unittest.TestCase):
             with mock.patch.object(panel, "run", side_effect=fake_run):
                 info, prefix = panel.discover_network("enp2s0", "")
             self.assertEqual(str(prefix), "240e:390:78c2:3e70::/64")
-            self.assertEqual(info["ipv6"], current)
+            self.assertEqual(info["ipv6"], stable)
+
+    def test_batch_creation_validates_lines_concurrently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = app.Panel(ConfigStub(directory))
+            panel.prefix = ipaddress.ip_network("2001:db8::/64")
+            panel.network = {"interface": "eth0", "prefix": str(panel.prefix), "ipv4": "192.0.2.1", "ipv6": "2001:db8::1"}
+            panel.add_address = lambda _ip: None
+            panel.delete_address = lambda _ip: None
+            panel.restart_xray = lambda: None
+            panel.check_egress = lambda _ip: time.sleep(.1)
+            started = time.monotonic()
+            created = panel.create_proxies("xmeng", "hy2", 5)
+            elapsed = time.monotonic() - started
+            self.assertEqual(len(created), 5)
+            self.assertLess(elapsed, .35)
 
     def test_ipv4_and_ipv6_listen_addresses_are_parsed(self):
         self.assertEqual(app.parse_listen("0.0.0.0:8080"), ("0.0.0.0", 8080))

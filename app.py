@@ -165,6 +165,7 @@ class Panel:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.RLock()
+        self.create_lock = threading.Lock()
         self.proxy_locks = {}
         self.rotating_ips = set()
         self.jobs = {}
@@ -277,7 +278,8 @@ class Panel:
             # SLAAC addresses may also be marked noprefixroute.  Addresses
             # created by this panel are the nodad+noprefixroute combination.
             managed = (bool(item.get("nodad")) or "nodad" in flags) and (bool(item.get("noprefixroute")) or "noprefixroute" in flags)
-            global_addresses.append((str(ip), managed))
+            temporary = bool(item.get("temporary")) or "temporary" in flags
+            global_addresses.append((str(ip), managed, temporary))
             if plen < 128:
                 candidates.append(ipaddress.ip_network("%s/%d" % (local, plen), strict=False))
         if prefix_override.strip():
@@ -292,8 +294,9 @@ class Panel:
             prefix = next((n for n in unique if preferred and preferred in n), unique[0])
         # Panel-managed addresses use noprefixroute. Prefer a system/tunnel
         # address as the stable HY2 ingress on hosts with an IPv6 address pool.
-        stable = [address for address, managed in global_addresses if not managed and ipaddress.ip_address(address) in prefix]
-        ingress_ipv6 = preferred_source if preferred_source and ipaddress.ip_address(preferred_source) in prefix else (stable[0] if stable else "")
+        stable = [address for address, managed, temporary in global_addresses if not managed and not temporary and ipaddress.ip_address(address) in prefix]
+        current_source = preferred_source if preferred_source and ipaddress.ip_address(preferred_source) in prefix else ""
+        ingress_ipv6 = stable[0] if stable else current_source
         return {"interface": iface, "prefix": str(prefix), "ipv4": ipv4, "ipv6": ingress_ipv6}, prefix
 
     def start(self):
@@ -565,49 +568,81 @@ class Panel:
         raise PanelError("已达到线路数量上限", 409, "proxy_limit")
 
     def create_proxies(self, owner, protocol="hy2", count=1, requested_port=None):
-        with self.lock:
-            return self._create_proxies(owner, protocol, count, requested_port)
+        return self._create_proxies(owner, protocol, count, requested_port)
 
     def _create_proxies(self, owner, protocol="hy2", count=1, requested_port=None):
-        if not self.find_user(owner, self.state):
-            raise PanelError("目标账号不存在", 404, "not_found")
-        protocol = protocol.strip().lower() or "hy2"
-        if protocol in ("hysteria", "hysteria2"):
-            protocol = "hy2"
-        if protocol in ("socks", "sk5"):
-            protocol = "socks5"
-        if protocol not in ("hy2", "socks5"):
-            raise PanelError("不支持的协议", 400, "invalid_protocol")
-        if not 1 <= count <= self.cfg.max_proxies or len(self.state["proxies"]) + count > self.cfg.max_proxies:
-            raise PanelError("已达到线路数量上限", 409, "proxy_limit")
-        if count > 1 and requested_port is not None:
-            raise PanelError("批量创建线路时不能手动指定端口", 400, "invalid_port")
-        user = self.find_user(owner, self.state)
-        created = []
-        activated = []
-        had_xray = bool(self.xray and self.xray.poll() is None)
-        try:
-            for _ in range(count):
-                port = self.allocate_port(requested_port)
-                ip = str(self.random_ip())
+        if not hasattr(self, "create_lock"):
+            self.create_lock = threading.Lock()
+        with self.create_lock:
+            with self.lock:
+                if not self.find_user(owner, self.state):
+                    raise PanelError("目标账号不存在", 404, "not_found")
+                protocol = protocol.strip().lower() or "hy2"
+                if protocol in ("hysteria", "hysteria2"):
+                    protocol = "hy2"
+                if protocol in ("socks", "sk5"):
+                    protocol = "socks5"
+                if protocol not in ("hy2", "socks5"):
+                    raise PanelError("不支持的协议", 400, "invalid_protocol")
+                if not 1 <= count <= self.cfg.max_proxies or len(self.state["proxies"]) + count > self.cfg.max_proxies:
+                    raise PanelError("已达到线路数量上限", 409, "proxy_limit")
+                if count > 1 and requested_port is not None:
+                    raise PanelError("批量创建线路时不能手动指定端口", 400, "invalid_port")
+                user = self.find_user(owner, self.state)
+                used_ports = {p["port"] for p in self.state["proxies"]}
+                planned_ips = set()
+                plans = []
+                for _ in range(count):
+                    if requested_port is not None:
+                        port = self.allocate_port(requested_port)
+                    else:
+                        port = next((candidate for candidate in range(self.cfg.base_port, self.cfg.base_port + self.cfg.max_proxies) if candidate not in used_ports), None)
+                        if port is None:
+                            raise PanelError("已达到线路数量上限", 409, "proxy_limit")
+                    used_ports.add(port)
+                    ip = str(self.random_ip())
+                    while ip in planned_ips:
+                        ip = str(self.random_ip())
+                    planned_ips.add(ip)
+                    plans.append((port, ip))
+                had_xray = bool(self.xray and self.xray.poll() is None)
+            created = []
+            activated = [ip for _, ip in plans]
+
+            def activate(plan):
+                _, ip = plan
                 self.add_address(ip)
-                activated.append(ip)
                 self.check_egress(ip)
-                proxy = {"id": str(port), "port": port, "protocol": protocol, "ipv6": ip, "status": "healthy", "createdAt": utc_now(), "owner": owner, "username": owner, "password": user["proxyPassword"]}
-                self.state["proxies"].append(proxy)
-                created.append(proxy)
-            self.restart_xray()
-            self.save()
-            return [dict(p) for p in created]
-        except Exception:
-            for proxy in created:
-                self.state["proxies"].remove(proxy)
-            for ip in activated:
-                self.delete_address(ip)
-            if had_xray:
-                with contextlib.suppress(Exception):
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(plans), thread_name_prefix="create") as executor:
+                    futures = [executor.submit(activate, plan) for plan in plans]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+
+                with self.lock:
+                    if not self.find_user(owner, self.state):
+                        raise PanelError("目标账号不存在", 404, "not_found")
+                    if any(ipaddress.ip_address(ip) not in self.prefix for _, ip in plans):
+                        raise RuntimeError("IPv6 前缀已变化，请重试")
+                    for port, ip in plans:
+                        proxy = {"id": str(port), "port": port, "protocol": protocol, "ipv6": ip, "status": "healthy", "createdAt": utc_now(), "owner": owner, "username": owner, "password": user["proxyPassword"]}
+                        self.state["proxies"].append(proxy)
+                        created.append(proxy)
                     self.restart_xray()
-            raise
+                    self.save()
+                    return [dict(p) for p in created]
+            except Exception:
+                with self.lock:
+                    for proxy in created:
+                        with contextlib.suppress(ValueError):
+                            self.state["proxies"].remove(proxy)
+                    if had_xray:
+                        with contextlib.suppress(Exception):
+                            self.restart_xray()
+                for ip in activated:
+                    self.delete_address(ip)
+                raise
 
     def delete_proxy(self, username, proxy_id):
         with self.lock:
@@ -667,19 +702,22 @@ class Panel:
                     self.rotating_ips.discard(new)
 
     def add_user(self, username, password):
+        username = username.strip()
         with self.lock:
-            if self.find_user(username.strip(), self.state):
+            if self.find_user(username, self.state):
                 raise PanelError("用户名已存在", 409, "user_exists")
             user = new_user(username, password)
             self.state["users"].append(user)
-            try:
-                self._create_proxies(user["username"], "hy2", 10)
+            self.save()
+        try:
+            self._create_proxies(user["username"], "hy2", 10)
+            return user
+        except Exception:
+            with self.lock:
+                with contextlib.suppress(ValueError):
+                    self.state["users"].remove(user)
                 self.save()
-                return user
-            except Exception:
-                self.state["users"].remove(user)
-                self.save()
-                raise
+            raise
 
     def delete_user(self, username):
         with self.lock:
