@@ -33,14 +33,19 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if [ -z "$INSTALL_IPV6_PREFIX" ] && [ -r /dev/tty ]; then
+HAS_TTY=0
+if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+  HAS_TTY=1
+fi
+
+if [ -z "$INSTALL_IPV6_PREFIX" ] && [ "$HAS_TTY" = "1" ]; then
   printf '请输入线路 IPv6 前缀（例如 2001:470:846a::/48，留空自动识别）: ' >/dev/tty
   IFS= read -r INSTALL_IPV6_PREFIX </dev/tty || true
 fi
 
 if [ -z "$ENABLE_HTTPS" ]; then
   ENABLE_HTTPS=0
-  if [ -r /dev/tty ]; then
+  if [ "$HAS_TTY" = "1" ]; then
     printf '是否启用 HTTPS 并自动申请 Let\047s Encrypt 免费证书？[y/N]: ' >/dev/tty
     IFS= read -r HTTPS_ANSWER </dev/tty || true
     case "$HTTPS_ANSWER" in y|Y|yes|YES) ENABLE_HTTPS=1 ;; esac
@@ -48,11 +53,11 @@ if [ -z "$ENABLE_HTTPS" ]; then
 fi
 
 if [ "$ENABLE_HTTPS" = "1" ]; then
-  if [ -z "$HTTPS_DOMAIN" ] && [ -r /dev/tty ]; then
+  if [ -z "$HTTPS_DOMAIN" ] && [ "$HAS_TTY" = "1" ]; then
     printf '请输入已解析到本服务器的域名: ' >/dev/tty
     IFS= read -r HTTPS_DOMAIN </dev/tty
   fi
-  if [ -z "$HTTPS_EMAIL" ] && [ -r /dev/tty ]; then
+  if [ -z "$HTTPS_EMAIL" ] && [ "$HAS_TTY" = "1" ]; then
     printf '请输入证书到期提醒邮箱（可留空）: ' >/dev/tty
     IFS= read -r HTTPS_EMAIL </dev/tty || true
   fi
